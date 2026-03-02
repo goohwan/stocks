@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import sys
 import time
@@ -12,6 +13,7 @@ from typing import Any
 
 NOTION_VERSION = "2022-06-28"
 NOTION_API_BASE = "https://api.notion.com/v1"
+KIWOOM_BASE_URL = "https://api.kiwoom.com"
 
 KST = dt.timezone(dt.timedelta(hours=9))
 
@@ -68,6 +70,40 @@ def env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError as exc:
         raise RuntimeError(f"{name} must be an integer") from exc
+
+
+def parse_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return default
+    try:
+        return int(float(text))
+    except ValueError:
+        return default
+
+
+def parse_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return default
+    try:
+        return float(text)
+    except ValueError:
+        return default
 
 
 def load_condition_config() -> ConditionConfig:
@@ -213,37 +249,185 @@ def upsert_page(
         print(f"Created new row: {record['code']}")
 
 
-def fetch_kiwoom_candidates() -> list[StockCandidate]:
-    require_env("KIWOOM_APP_KEY")
-    require_env("KIWOOM_APP_SECRET")
-    url = require_env("KIWOOM_CANDIDATES_URL")
-    access_token = require_env("KIWOOM_ACCESS_TOKEN")
+def build_kiwoom_headers(access_token: str, api_id: str | None = None) -> dict[str, str]:
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json;charset=UTF-8",
+    }
+    if api_id:
+        headers["api-id"] = api_id
+    return headers
 
+
+def issue_kiwoom_access_token(app_key: str, app_secret: str, base_url: str) -> str:
+    data = http_json_request(
+        method="POST",
+        url=f"{base_url}/oauth2/token",
+        headers={"Content-Type": "application/json;charset=UTF-8"},
+        payload={
+            "grant_type": "client_credentials",
+            "appkey": app_key,
+            "secretkey": app_secret,
+        },
+    )
+    token = data.get("token") or data.get("access_token")
+    if not isinstance(token, str) or not token.strip():
+        raise RuntimeError("Kiwoom token response does not include token")
+    return token.strip()
+
+
+def extract_kiwoom_items(data: dict[str, Any]) -> list[dict[str, Any]]:
+    for key in (
+        "items",
+        "bid_req_upper",
+        "trde_amt_upper",
+        "trde_qty_upper",
+        "flu_rt_upper",
+    ):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+
+    for value in data.values():
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+
+    keys = ", ".join(sorted(data.keys()))
+    raise RuntimeError(f"Kiwoom response must include a list payload. keys={keys}")
+
+
+def to_candidate_from_custom_item(item: dict[str, Any]) -> StockCandidate | None:
+    code = str(item.get("code", "")).strip()
+    name = str(item.get("name", "")).strip()
+    if not code or not name:
+        return None
+    return StockCandidate(
+        code=code,
+        name=name,
+        change_pct=parse_float(item.get("change_pct"), 0.0),
+        trade_value=parse_int(item.get("trade_value"), 0),
+        market_cap=parse_int(item.get("market_cap"), 0),
+    )
+
+
+def to_candidate_from_rank_item(item: dict[str, Any], fallback_market_cap: int) -> StockCandidate | None:
+    code = str(item.get("stk_cd") or item.get("code") or "").strip()
+    if code.startswith("A") and code[1:].isdigit():
+        code = code[1:]
+    name = str(item.get("stk_nm") or item.get("name") or "").strip()
+    if not code or not name:
+        return None
+
+    current_price = abs(parse_int(item.get("cur_prc"), 0))
+    prev_change = parse_int(item.get("pred_pre"), 0)
+    sign = str(item.get("pred_pre_sig") or "").strip()
+    if sign in {"2", "+", "up", "UP"}:
+        prev_change = abs(prev_change)
+    elif sign in {"5", "-", "down", "DOWN"}:
+        prev_change = -abs(prev_change)
+
+    change_pct = parse_float(item.get("flu_rt"), math.nan)
+    if math.isnan(change_pct):
+        prev_close = current_price - prev_change
+        change_pct = (prev_change / prev_close * 100) if prev_close > 0 else 0.0
+
+    trade_value = parse_int(item.get("trde_amt"), 0)
+    if trade_value <= 0:
+        trade_qty = abs(parse_int(item.get("trde_qty"), 0))
+        trade_value = current_price * trade_qty
+
+    market_cap = parse_int(item.get("mket_tot_amt") or item.get("mrkt_tot_amt"), 0)
+    if market_cap <= 0:
+        market_cap = fallback_market_cap
+
+    return StockCandidate(
+        code=code,
+        name=name,
+        change_pct=change_pct,
+        trade_value=trade_value,
+        market_cap=market_cap,
+    )
+
+
+def fetch_kiwoom_candidates_from_custom_url(url: str, access_token: str) -> list[StockCandidate]:
     data = http_json_request(
         method="GET",
         url=url,
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json",
-        },
+        headers=build_kiwoom_headers(access_token),
     )
-
     raw_items = data.get("items")
     if not isinstance(raw_items, list):
-        raise RuntimeError("Kiwoom response must include items list")
+        raise RuntimeError("Kiwoom custom response must include items list")
 
     candidates: list[StockCandidate] = []
     for item in raw_items:
-        candidates.append(
-            StockCandidate(
-                code=str(item.get("code", "")).strip(),
-                name=str(item.get("name", "")).strip(),
-                change_pct=float(item.get("change_pct", 0.0)),
-                trade_value=int(item.get("trade_value", 0)),
-                market_cap=int(item.get("market_cap", 0)),
-            )
-        )
+        if not isinstance(item, dict):
+            continue
+        candidate = to_candidate_from_custom_item(item)
+        if candidate:
+            candidates.append(candidate)
     return candidates
+
+
+def fetch_kiwoom_candidates_from_rank_api(base_url: str, access_token: str) -> list[StockCandidate]:
+    url = f"{base_url}/api/dostk/rkinfo"
+    api_id = env("KIWOOM_RANK_API_ID", "ka10020")
+    market_types = [
+        value.strip() for value in env("KIWOOM_MRKT_TP_LIST", "001,101").split(",") if value.strip()
+    ]
+    if not market_types:
+        market_types = ["001"]
+
+    fallback_market_cap = env_int(
+        "KIWOOM_FALLBACK_MARKET_CAP",
+        env_int("MIN_MARKET_CAP", 300_000_000_000),
+    )
+
+    candidates: list[StockCandidate] = []
+    for market_type in market_types:
+        payload = {
+            "mrkt_tp": market_type,
+            "sort_tp": env("KIWOOM_SORT_TP", "3"),
+            "trde_qty_tp": env("KIWOOM_TRDE_QTY_TP", "00100"),
+            "stk_cnd": env("KIWOOM_STK_CND", "1"),
+            "crd_cnd": env("KIWOOM_CRD_CND", "0"),
+            "stex_tp": env("KIWOOM_STEX_TP", "1"),
+        }
+        data = http_json_request(
+            method="POST",
+            url=url,
+            headers=build_kiwoom_headers(access_token, api_id=api_id),
+            payload=payload,
+        )
+        for item in extract_kiwoom_items(data):
+            candidate = to_candidate_from_rank_item(item, fallback_market_cap)
+            if candidate:
+                candidates.append(candidate)
+
+    if not candidates:
+        raise RuntimeError("Kiwoom rank API returned no candidate rows")
+
+    by_code: dict[str, StockCandidate] = {}
+    for candidate in candidates:
+        current = by_code.get(candidate.code)
+        if current is None or candidate.trade_value > current.trade_value:
+            by_code[candidate.code] = candidate
+    return list(by_code.values())
+
+
+def fetch_kiwoom_candidates() -> list[StockCandidate]:
+    app_key = require_env("KIWOOM_APP_KEY")
+    app_secret = require_env("KIWOOM_APP_SECRET")
+    base_url = env("KIWOOM_BASE_URL", KIWOOM_BASE_URL).rstrip("/")
+
+    access_token = env("KIWOOM_ACCESS_TOKEN")
+    if not access_token:
+        access_token = issue_kiwoom_access_token(app_key, app_secret, base_url)
+
+    custom_url = env("KIWOOM_CANDIDATES_URL")
+    if custom_url:
+        return fetch_kiwoom_candidates_from_custom_url(custom_url, access_token)
+    return fetch_kiwoom_candidates_from_rank_api(base_url, access_token)
 
 
 def fetch_mock_candidates() -> list[StockCandidate]:
