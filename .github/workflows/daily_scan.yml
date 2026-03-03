@@ -27,8 +27,8 @@ on:
         default: 001,101
         type: string
   schedule:
-    # KST 13:15 = UTC 04:15
-    - cron: "15 4 * * *"
+    # KST 12:05 = UTC 03:05 (test run)
+    - cron: "5 3 * * *"
 
 jobs:
   update-notion:
