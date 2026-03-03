@@ -22,7 +22,7 @@ on:
         default: ka10020
         type: string
       market_types:
-        description: Comma-separated market types (example: 001,101)
+        description: "Comma-separated market types (example: 001,101)"
         required: false
         default: 001,101
         type: string
