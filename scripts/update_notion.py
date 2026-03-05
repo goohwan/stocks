@@ -276,7 +276,8 @@ def issue_kiwoom_access_token(app_key: str, app_secret: str, base_url: str) -> s
     )
     token = data.get("token") or data.get("access_token")
     if not isinstance(token, str) or not token.strip():
-        raise RuntimeError("Kiwoom token response does not include token")
+        data_dump = json.dumps(data, ensure_ascii=False)
+        raise RuntimeError(f"Kiwoom token response does not include token: {data_dump}")
     return token.strip()
 
 
